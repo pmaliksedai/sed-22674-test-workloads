@@ -1,0 +1,76 @@
+# B1 - the repro for 7d97fab (SED-22674, "Allow horizontal scaling for externally scaled workloads").
+#
+# RolloutDelegate.java:419 does  sedaiApp.setDesiredReplicas(rollout.getSpec().getReplicas())  and
+# RolloutSpec.getReplicas() is a nullable Integer. An Argo Rollout that leaves spec.replicas unset - because
+# another controller or a GitOps template owns the count - therefore lands in Sedai as desiredReplicas = 0
+# while pods are running, and every "does this workload have replicas" gate answers no: no HPA
+# recommendation, no profiling, no opportunity generation, ZERO_REPLICAS blocker, and bucket placement
+# drops it into the Job branch.
+#
+# getEffectiveReplicaCount now resolves three tiers in order:
+#   1. spec desiredReplicas          -> null here, so it falls through
+#   2. status availableReplicas / readyReplicas   <-- this is the tier a real cluster exercises
+#   3. discovered pods (instanceIds)
+#
+# Deliberately NO HPA on this workload: an HPA scales through the scale subresource, which WRITES
+# spec.replicas and destroys the precondition the test depends on.
+#
+# PRECONDITION - check this before believing any result:
+#   kubectl -n sedai-inflated-hpa get rollout externally-scaled-rollout -o jsonpath='{.spec.replicas}'
+#   -> must print NOTHING. If it prints a number, the controller filled it in and this is no longer the
+#      broken shape; use variant B1b below, or drop to a lower argo-rollouts version.
+#
+# EXPECT (post-fix): the workload is optimizable, gets a CPU-saturation availability recommendation, and
+#   core logs "Workload <id> reports no spec/status replicas but has N discovered pods; treating it as
+#   externally scaled" only if it reached tier 3.
+# EXPECT (pre-fix): notes read "Resource Doesn't have any Replicas." and nothing is generated.
+#
+# Requires the Argo Rollouts controller:
+#   kubectl create namespace argo-rollouts
+#   kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: externally-scaled-rollout
+  namespace: sedai-inflated-hpa
+  annotations:
+    settings.sedai.io/metricsEvaluation.minPeriodInHours: "1"
+    settings.sedai.io/availability.configMode: AUTO
+spec:
+  # spec.replicas is deliberately ABSENT. This single omission is the whole test.
+  selector:
+    matchLabels:
+      app: externally-scaled-rollout
+  strategy:
+    canary: {}
+  template:
+    metadata:
+      labels:
+        app: externally-scaled-rollout
+    spec:
+      containers:
+        - name: burner
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do :; done"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: externally-scaled-rollout
+  namespace: sedai-inflated-hpa
+spec:
+  type: ClusterIP
+  selector:
+    app: externally-scaled-rollout
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP

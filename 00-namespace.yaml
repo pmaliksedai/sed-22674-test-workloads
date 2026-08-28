@@ -1,0 +1,14 @@
+# Namespaces for the SED-22674 test workloads.
+#
+#   sedai-inflated-hpa         - the movable-limit scenarios (A1, A3, A4, A5) and the Argo Rollout ones (B1, B2)
+#   sedai-inflated-hpa-frozen  - A2 only. It carries a LimitRange, which would silently inject limits into
+#                                any container in the namespace that declares none, so it is kept separate.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sedai-inflated-hpa
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sedai-inflated-hpa-frozen

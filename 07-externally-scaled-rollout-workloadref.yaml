@@ -1,0 +1,77 @@
+# B1b - the same PR-1 shape, but with two replicas.
+#
+# Why a second variant: B1a with spec.replicas omitted runs ONE pod, and
+# minReplicasForProfileEligibility is 2 in prod optimizationConfig, so B1a proves the availability and
+# ZERO_REPLICAS gates but cannot prove the profiling one. Here the replica count genuinely belongs to
+# another object - the referenced Deployment - which is the literal "another controller owns the replica
+# count" case the commit describes, and it gives 2 pods.
+#
+# PRECONDITION - the rollout's own spec.replicas must still be empty:
+#   kubectl -n sedai-inflated-hpa get rollout externally-scaled-workloadref -o jsonpath='{.spec.replicas}'
+# Some argo-rollouts versions copy the referenced Deployment's replica count into the Rollout spec. If
+# this prints 2, this variant is not testing anything and B1a is the one that counts. Check it first.
+#
+# scaleDown: onsuccess makes the controller scale the referenced Deployment to 0 once the rollout is
+# healthy, so you get 2 pods total rather than 4.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: externally-scaled-source
+  namespace: sedai-inflated-hpa
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: externally-scaled-workloadref
+  template:
+    metadata:
+      labels:
+        app: externally-scaled-workloadref
+    spec:
+      containers:
+        - name: burner
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do :; done"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: externally-scaled-workloadref
+  namespace: sedai-inflated-hpa
+  annotations:
+    settings.sedai.io/metricsEvaluation.minPeriodInHours: "1"
+    settings.sedai.io/availability.configMode: AUTO
+spec:
+  # Again: no spec.replicas. The count comes from the Deployment referenced below.
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: externally-scaled-source
+    scaleDown: onsuccess
+  selector:
+    matchLabels:
+      app: externally-scaled-workloadref
+  strategy:
+    canary: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: externally-scaled-workloadref
+  namespace: sedai-inflated-hpa
+spec:
+  type: ClusterIP
+  selector:
+    app: externally-scaled-workloadref
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP

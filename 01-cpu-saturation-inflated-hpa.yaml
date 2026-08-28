@@ -1,0 +1,95 @@
+# A1 - the primary repro for f761f26 (SED-22674, "Honor HPA targets above 100%").
+#
+# The shape: an HPA can only compare usage against the REQUEST, so an operator who wants limit-relative
+# scaling pins the request below the limit and inflates averageUtilization by the same factor.
+#
+#     cpu: 170% x (250m request / 500m limit) = "scale out at 85% of the limit" = 425m
+#
+# Before the fix the buffer fraction was (100 - 170)/100 = -0.70. A negative fraction reads everywhere
+# downstream as "no HPA on this resource", so the target was silently dropped and the workload was sized
+# as if it had no autoscaler. An availability remediation then sized request and limit independently and
+# could push request x 170% above the proposed limit - where the container is throttled before the HPA
+# can ever fire, i.e. the remediation costs the workload its horizontal scaling.
+#
+# The load: a single-threaded busy loop, so cgroup throttling pins usage at exactly the CPU limit.
+# Saturation = max_over_time(max_usage / limit) over a 90 min window, and the threshold is
+# kubernetesCPUSaturationPercent: 0.75. 500m/500m = 1.0, so this fires reliably.
+#
+# EXPECT (post-fix): an availability recommendation for SET_KUBERNETES_CPU_LIMIT, reason
+# KUBERNETES_CPU_SATURATION, whose proposed pair satisfies
+#
+#     proposedRequest x 1.70 x 1.05  <=  proposedLimit          (1.05 = hpaPercBuffer 5%)
+#
+# The limit is movable and the remediation grows it, so node [2] of the tree raises the LIMIT and leaves
+# the request the remediation chose. Core logs:
+#   "the HPA scales out at ..., above the ... limit, so it could never fire. This change already raises
+#    the limit, so raising it to ... - the scale-out point plus 5% buffer"
+#
+# The HPA will scale out (usage is 200% of the request, above the 170% target). maxReplicas is capped at
+# 3 to bound what this costs on a real cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflated-hpa-cpu-sat
+  namespace: sedai-inflated-hpa
+  annotations:
+    # Shortens the metrics-evaluation warm-up so the workload becomes actionable in ~1h instead of the default.
+    settings.sedai.io/metricsEvaluation.minPeriodInHours: "1"
+    # AUTO executes the remediation; use CO_PILOT if you only want the recommendation surfaced for approval.
+    settings.sedai.io/availability.configMode: AUTO
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inflated-hpa-cpu-sat
+  template:
+    metadata:
+      labels:
+        app: inflated-hpa-cpu-sat
+    spec:
+      containers:
+        - name: burner
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do :; done"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inflated-hpa-cpu-sat
+  namespace: sedai-inflated-hpa
+spec:
+  type: ClusterIP
+  selector:
+    app: inflated-hpa-cpu-sat
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inflated-hpa-cpu-sat
+  namespace: sedai-inflated-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inflated-hpa-cpu-sat
+  minReplicas: 2
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 170

@@ -1,0 +1,96 @@
+# A2 - the other branch of node [2]: the limit CANNOT move, so the REQUEST is what gives.
+#
+# A limit is frozen when the pod-template declares none and enableCpuLimitModification is off
+# (KubeService.isCpuLimitFrozenByUnsetTemplate, SED-21331) - the limit on the running pod came from a
+# LimitRange or a mutating webhook, so it is not Sedai's to write. That is exactly the shape below: the
+# container declares only a request, and the namespace LimitRange injects the 500m limit onto the pod.
+#
+# EXPECT (post-fix): saturation is remediated by lowering the REQUEST rather than raising the limit -
+#     largestRequestUnder(500m) = 500 / (1.70 x 1.05) = 280m
+#   core log: "..., above the 500m limit, so it could never fire. The limit is frozen for this container,
+#              so lowering the request to 280m - the largest whose scale-out point still fits under it"
+#
+# 280m is above k8sMinCPURequestInCores (0.1 cores), so no warn line here. To see the "keeping the HPA
+# target reachable needs a request below the configured minimum" warn instead, raise averageUtilization
+# to 450: 500 / (4.50 x 1.05) = 106m, and at 500 it lands at 95m, under the 100m floor.
+#
+# PRECONDITION: enableCpuLimitModification must be false for this resource (the default). Verify after
+# the pods start that the limit really was injected and not declared:
+#   kubectl -n sedai-inflated-hpa-frozen get deploy frozen-limit-cpu-sat \
+#     -o jsonpath='{.spec.template.spec.containers[0].resources}'      # -> requests only, no limits
+#   kubectl -n sedai-inflated-hpa-frozen get pod -l app=frozen-limit-cpu-sat \
+#     -o jsonpath='{.items[0].spec.containers[0].resources.limits.cpu}' # -> 500m
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: inject-cpu-limit
+  namespace: sedai-inflated-hpa-frozen
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frozen-limit-cpu-sat
+  namespace: sedai-inflated-hpa-frozen
+  annotations:
+    settings.sedai.io/metricsEvaluation.minPeriodInHours: "1"
+    settings.sedai.io/availability.configMode: AUTO
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frozen-limit-cpu-sat
+  template:
+    metadata:
+      labels:
+        app: frozen-limit-cpu-sat
+    spec:
+      containers:
+        - name: burner
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do :; done"]
+          resources:
+            # Deliberately NO limits block - the LimitRange above injects it onto the pod.
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frozen-limit-cpu-sat
+  namespace: sedai-inflated-hpa-frozen
+spec:
+  type: ClusterIP
+  selector:
+    app: frozen-limit-cpu-sat
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frozen-limit-cpu-sat
+  namespace: sedai-inflated-hpa-frozen
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frozen-limit-cpu-sat
+  minReplicas: 2
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 170

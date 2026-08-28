@@ -1,0 +1,72 @@
+# A4 - CONTROL. Identical to A1 except the HPA target is an ordinary 0-100 one.
+#
+# HpaTarget.isAboveBasis() is false here, so node [2] of the tree is a no-op and sizing keeps the
+# pre-existing behaviour: sizingBufferFraction = (100 - 70 + 5)/100 = 0.35 of headroom reserved while
+# sizing, exactly as before f761f26.
+#
+# EXPECT: an availability CPU recommendation that looks the same as it did before the change. If this one
+# moves, the change has leaked into the ordinary path and that is a regression, not a fix.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: normal-hpa-cpu-sat
+  namespace: sedai-inflated-hpa
+  annotations:
+    settings.sedai.io/metricsEvaluation.minPeriodInHours: "1"
+    settings.sedai.io/availability.configMode: AUTO
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: normal-hpa-cpu-sat
+  template:
+    metadata:
+      labels:
+        app: normal-hpa-cpu-sat
+    spec:
+      containers:
+        - name: burner
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do :; done"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: normal-hpa-cpu-sat
+  namespace: sedai-inflated-hpa
+spec:
+  type: ClusterIP
+  selector:
+    app: normal-hpa-cpu-sat
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: normal-hpa-cpu-sat
+  namespace: sedai-inflated-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: normal-hpa-cpu-sat
+  minReplicas: 2
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
